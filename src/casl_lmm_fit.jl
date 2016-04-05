@@ -340,8 +340,19 @@ end
 
 
 function get_differents_df(df::DataFrame=gm,
-                           cols::Vector{Symbol}=demo_cols(),
+                           cols::Vector{Symbol}=demo_cols();
                            normalize::Bool=false)
-  different_cols::Vector{Symbol} = collect(keys(get_different_cols(df, cols)))
-  stack(df[[:dx; different_cols]], different_cols)
+  different_cols::Vector{Symbol} = begin
+    cols_ps::Dict{Symbol, Float64} = get_different_cols(df, cols)
+    [cp[1] for cp in sort(collect(cols_ps), by=cp->cp[2])]
+  end
+
+  input = copy(df[[:dx; different_cols]])
+  for c in different_cols
+    input[c] = permute_na(input[c], mean)
+    if normalize
+      input[c] = (input[c] - mean(input[c]))/std(input[c])
+    end
+  end
+  stack(input, different_cols)
 end
