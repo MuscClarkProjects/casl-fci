@@ -1,4 +1,5 @@
 using DataFrames
+using Formatting
 using Lazy
 using Memoize
 using MixedModels
@@ -13,11 +14,17 @@ data_dir  = "../data"
 
 inputtable(f::AbstractString, separator='\t') = readtable("$data_dir/input/$f", separator=separator)
 
-
-function convert2symbols(df,sym)
-    confun = x -> isna(x) ? NA : convert(Symbol,x)
-    return [ confun(df[i,sym]) for i in 1:size(df,1) ]
+function convert2type{T}(da::DataArray, instance::T)
+  na_ixs = [isna(i)::Bool for i in da]
+  ret::DataArray{T} = @data([isna(i) ? instance :
+                               convert(T, i) for i in da ])
+  ret[na_ixs] = NA
+  ret
 end
+
+convert2symbols(da::DataArray) = convert2type(da, :a)
+
+convert2float(da::DataArray) = convert2type(da, 0.)
 
 string2formula(s::AbstractString) = eval(parse(s))
 
@@ -100,7 +107,7 @@ end
 
 function convert2symbols!(df::DataFrame, cols::Vector{Symbol})
   for c in cols
-    df[c] = convert2symbols(df, c)
+    df[c] = convert2symbols(df[c])
   end
 end
 
@@ -227,26 +234,73 @@ function display_bootstrap_results(model::LinearMixedModel,
 end
 
 
+function ztransform!(df::DataFrame, cols::Vector{Symbol})
+
+  for c in cols
+    na_ixs = Bool[isna(i) for i in df[c]]
+
+    data::Vector{Float64} = zeros(Float64, length(df[c]))
+    data[!na_ixs] = zscore(dropna(df[c]))
+    df[symbol(c, "_z")] = data
+  end
+
+  df
+end
+
+ztransform(df::DataFrame, cols::Vector{Symbol}) = ztransform!(copy(df), cols)
+
+
 get_follow_ups(df::DataFrame) = findin(df[:viscode],[:bl,:y1,:y2,:y3,:y4,:y5])
 
 pcas = Symbol[ symbol("pca_", i) for i in 1:19 ]
 
-casl = inputtable("casl_longitudinal_baseline_11Dec2015.txt")
-convert2symbols!(casl, [:subject, :viscode, :dx])
-casl = casl[get_follow_ups(casl), :]
+@memoize casl() = begin
+  ret = inputtable("casl_longitudinal_baseline_11Dec2015.txt")
+  convert2symbols!(ret, [:subject, :viscode, :dx])
+  ret[get_follow_ups(ret), :]
+end
 
-gm = inputtable("casl_longitudinal_baseline+gm_11Dec2015.txt")
-convert2symbols!(gm, [:subject, :viscode, :dx])
-gm = normalize_variables(gm[get_follow_ups(gm), :], pcas)
+@memoize gm() = begin
+  ret = inputtable("casl_longitudinal_baseline+gm_11Dec2015.txt")
+  convert2symbols!(ret, [:subject, :viscode, :dx])
+  normalize_variables(ret[get_follow_ups(ret), :], pcas)
+end
 
-casl_av = inputtable("casl_longitudinal_all_visits_8Dec2015.txt")
-convert2symbols!(casl_av, [:subject, :viscode, :dx])
+@memoize casl_av() = begin
+  ret = inputtable("casl_longitudinal_all_visits_8Dec2015.txt")
+  convert2symbols!(ret, [:subject, :viscode, :dx])
+  ret
+end
 
-gm_av = inputtable("casl_longitudinal_all_visits_with_GM_8Dec2015.txt")
-convert2symbols!(gm_av, [:subject, :viscode, :dx])
-gm_av = normalize_variables(gm_av, pcas)
+@memoize gm_av() = begin
+  ret = inputtable("casl_longitudinal_all_visits_with_GM_8Dec2015.txt")
+  convert2symbols!(ret, [:subject, :viscode, :dx])
+  normalize_variables(ret, pcas)
+end
 
-function get_best_baseline_model(df::DataFrame=gm, baseline_only=build_all_models(casl,gm))
+@memoize raw() = begin
+  ret = inputtable("casl_longitudinal_raw.txt")
+  convert2symbols!(ret, [:subject, :viscode, :dx])
+
+  z_transform_infos = inputtable("z_transform_cols.txt")
+  convert2symbols!(z_transform_infos, [:summed_for, :col])
+
+  calc_order = sort(unique(z_transform_infos[:calc_order]))
+  for c in calc_order
+    curr_rows::Vector{Bool} = z_transform_infos[:calc_order] .== c
+    cols::Vector{Symbol} = Array(z_transform_infos[curr_rows, :col])
+    ztransform!(ret, cols)
+
+    s::Symbol = z_transform_infos[curr_rows, :summed_for][1]
+
+    z_cols::Vector{Symbol} = [symbol(c, "_z") for c in cols]
+    ret[s] = sum(Matrix(ret[z_cols]), 2)[:]
+  end
+
+  ret
+end
+
+function get_best_baseline_model(df::DataFrame=gm(), baseline_only=build_all_models(casl(), gm()))
 
   fm::Formula = begin
     baseline_aics::Vector{Tuple{Float64, ASCIIString}} = [ (m[2][1],m[2][3]) for m in baseline_only ]
@@ -267,7 +321,7 @@ function get_bootstrap_results(baseline_model::LinearMixedModel, niters::Int64=1
 end
 
 
-function permute_na{T <: Real}(da::DataArray{T}, fn::Function=mean)
+function permute_na(da::DataArray, fn::Function=mean)
   na_ixs::Vector{Bool} = map(isna, da)
   da[na_ixs] = fn(dropna(da))
   da
@@ -288,14 +342,17 @@ function col_measures(df::AbstractDataFrame, col::Symbol)
   elseif col == :race
     item_counts( (c, ct) -> "$c: $ct")
   else
-    mn, std = mean_and_std(Array(permute_na(df[col], mean)))
+    da::DataArray = df[col]
+    da = isa(da, AbstractVector{Float64}) || (convert2float(da))
+
+    mn, std = mean_and_std(Array(permute_na(da, mean)))
     "mean: $(fmt(mn)), std: $(fmt(std))"
   end
 end
 
 demo_cols() = Symbol[symbol(n) for n in readcsv("$data_dir/input/demographics_cols.csv")]
 
-function group_by_dx(df::DataFrame=gm)
+function group_by_dx(df::DataFrame=raw())
 
   set_col_measures(grouped_df::AbstractDataFrame) = begin
     reduce(DataFrame(), demo_cols()) do acc, c
@@ -313,7 +370,7 @@ save_group_by_dx(df::DataFrame,
                  f::AbstractString="$data_dir/step1/group_by_dx.csv") = writetable(f, df)
 
 
-function calcanova2(col::Symbol, df::DataFrame=gm)
+function calcanova2(col::Symbol, df::DataFrame=raw())
   dxdata(dx::Symbol) = Array(permute_na(df[df[:dx] .== dx, :][col]))
 
   calcanova(map(dxdata, [:nc, :mci, :ad])...)
@@ -323,7 +380,7 @@ end
 convert_race(df::DataFrame) = [i == "B" ? 1 : 0 for i in df[:race]]
 
 
-function get_different_cols(df::DataFrame=gm, cols::Vector{Symbol}=demo_cols())
+function get_different_cols(df::DataFrame=raw(), cols::Vector{Symbol}=demo_cols())
   df2::DataFrame = copy(df[:, [:dx; cols]])
   in(:race, names(df2)) && (df2[:race] = convert_race(df2))
 
@@ -339,7 +396,7 @@ function get_different_cols(df::DataFrame=gm, cols::Vector{Symbol}=demo_cols())
 end
 
 
-function get_differents_df(df::DataFrame=gm,
+function get_differents_df(df::DataFrame=raw(),
                            cols::Vector{Symbol}=demo_cols();
                            normalize::Bool=false)
   different_cols::Vector{Symbol} = begin

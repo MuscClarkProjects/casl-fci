@@ -34,13 +34,12 @@ dom5_total
 dom7a
 dom7b
 dom7c
-dom7_total
+dom_7total
 fci
-sem
+semantic
 vbl
 exe
 mem
 vis
 atn
 fci_fu
-eTIV
