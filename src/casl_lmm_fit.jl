@@ -343,22 +343,35 @@ function col_measures(df::AbstractDataFrame, col::Symbol)
     item_counts( (c, ct) -> "$c: $ct")
   else
     da::DataArray = df[col]
-    da = isa(da, AbstractVector{Float64}) || (convert2float(da))
+    isa(da, AbstractVector{Float64}) || (da = convert2float(da))
 
     mn, std = mean_and_std(Array(permute_na(da, mean)))
-    "mean: $(fmt(mn)), std: $(fmt(std))"
+    "$(fmt(mn)) ± $(fmt(std))"
   end
 end
 
 demo_cols() = Symbol[symbol(n) for n in readcsv("$data_dir/input/demographics_cols.csv")]
 
-function group_by_dx(df::DataFrame=raw())
+function group_by_dx(df::DataFrame=raw(),
+                     valid_dxs::Set{Symbol}=Set([:nc, :mci, :ad]),
+                     pre_process_fn::Function = df::DataFrame -> begin
+                       df = copy(df)
+                       df[df[:dx] .== :aami, :dx] = :nc
+                       df
+                     end)
 
   set_col_measures(grouped_df::AbstractDataFrame) = begin
     reduce(DataFrame(), demo_cols()) do acc, c
       acc[c] = col_measures(grouped_df, c)
       acc
     end
+  end
+
+  df::DataFrame = begin
+    ret::DataFrame = df[Bool[!isna(i) for i in df[:dx]], :]
+    ret = pre_process_fn(ret)
+    valid_rows = [in(i, valid_dxs)::Bool for i in ret[:dx]]
+    ret[valid_rows, :]
   end
 
   by(df, [:dx], set_col_measures)
