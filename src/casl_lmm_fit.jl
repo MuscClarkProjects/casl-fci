@@ -3,7 +3,8 @@ using Formatting
 using Lazy
 using Memoize
 using MixedModels
-using MultivariateStats # , PyPlot
+using MultivariateStats
+using PyCall
 using PValueAdjust
 using SimpleAnova
 
@@ -279,8 +280,24 @@ end
 end
 
 @memoize raw() = begin
-  ret = inputtable("casl_longitudinal_raw.txt")
-  convert2symbols!(ret, [:subject, :viscode, :dx])
+  ret::DataFrame = begin
+    loaded_data = inputtable("casl_longitudinal_raw.txt")
+    convert2symbols!(loaded_data, [:subject, :viscode, :dx])
+
+    valid_dxs::Set{Symbol} = Set([:nc, :mci, :ad, :aami])
+
+    valid_subjects::Set{Symbol} = Set(gm()[:subject])
+
+    is_valid_row(r::Int64) = begin
+      item(col::Symbol) = loaded_data[r, col]
+      in(item(:subject), valid_subjects) &&
+        item(:viscode)==:bl &&
+        in(item(:dx), valid_dxs)
+    end
+
+    valid_rows::Vector{Bool} = map(is_valid_row, 1:size(loaded_data, 1))
+    merge_aami_into_nc!(loaded_data[valid_rows, :])
+  end
 
   z_transform_infos = inputtable("z_transform_cols.txt")
   convert2symbols!(z_transform_infos, [:summed_for, :col])
@@ -293,7 +310,7 @@ end
 
     s::Symbol = z_transform_infos[curr_rows, :summed_for][1]
 
-    z_cols::Vector{Symbol} = [symbol(c, "_z") for c in cols]
+    z_cols::Vector{Symbol} = [symbol(col, "_z") for col in cols]
     ret[s] = sum(Matrix(ret[z_cols]), 2)[:]
   end
 
@@ -327,6 +344,16 @@ function permute_na(da::DataArray, fn::Function=mean)
   da
 end
 
+
+function permute_na_floatsafe{T}(da::AbstractVector{T}, fn::Function=mean)
+  dfloat::AbstractVector{Float64} = @switch T begin
+    Float64; da;
+    convert2float(da)
+  end
+
+  Array(permute_na(dfloat, fn))
+end
+
 function col_measures(df::AbstractDataFrame, col::Symbol)
 
   item_counts(label_fn) = begin
@@ -352,26 +379,23 @@ end
 
 demo_cols() = Symbol[symbol(n) for n in readcsv("$data_dir/input/demographics_cols.csv")]
 
-function group_by_dx(df::DataFrame=raw(),
-                     valid_dxs::Set{Symbol}=Set([:nc, :mci, :ad]),
-                     pre_process_fn::Function = df::DataFrame -> begin
-                       df = copy(df)
-                       df[df[:dx] .== :aami, :dx] = :nc
-                       df
-                     end)
+
+
+function merge_aami_into_nc!(df::DataFrame)
+  df[df[:dx] .== :aami, :dx] = :nc
+  df
+end
+merge_aami_into_nc(df::DataFrame) = merge_aami_into_nc!(copy(df))
+
+
+function group_by_dx(df::DataFrame=raw();
+                     cols::AbstractVector{Symbol}=demo_cols())
 
   set_col_measures(grouped_df::AbstractDataFrame) = begin
-    reduce(DataFrame(), demo_cols()) do acc, c
+    reduce(DataFrame(), cols) do acc, c
       acc[c] = col_measures(grouped_df, c)
       acc
     end
-  end
-
-  df::DataFrame = begin
-    ret::DataFrame = df[Bool[!isna(i) for i in df[:dx]], :]
-    ret = pre_process_fn(ret)
-    valid_rows = [in(i, valid_dxs)::Bool for i in ret[:dx]]
-    ret[valid_rows, :]
   end
 
   by(df, [:dx], set_col_measures)
@@ -383,10 +407,32 @@ save_group_by_dx(df::DataFrame,
                  f::AbstractString="$data_dir/step1/group_by_dx.csv") = writetable(f, df)
 
 
-function calcanova2(col::Symbol, df::DataFrame=raw())
-  dxdata(dx::Symbol) = Array(permute_na(df[df[:dx] .== dx, :][col]))
+immutable Count
+  c::Int64
+end
 
-  calcanova(map(dxdata, [:nc, :mci, :ad])...)
+@pyimport scipy.stats as sts
+function chisq(counts::AbstractVector{Count})
+  sts.chisquare([c.c for c in counts])
+end
+
+
+chisq{T}(data::AbstractVector{T}) = begin
+  count_eq{T}(t::T) = Count(count(i -> i == t, data))
+  counts::AbstractVector{Count} = map(count_eq, unique(data))
+  chisq(counts)
+end
+
+
+function calcstatdiff(col::Symbol, df::DataFrame=raw())
+  dxdata(dx::Symbol) = permute_na_floatsafe(df[df[:dx] .== dx, col])
+
+  @switch col begin
+    :race; chisq(df[col])[2]; #extra semi-colon for proper syntax highlighting in Juno
+    :sex; chisq(df[col])[2];
+    calcanova(map(dxdata, [:nc, :mci, :ad])...).resultsInfo[1, :PValue]
+  end
+
 end
 
 
@@ -394,10 +440,13 @@ convert_race(df::DataFrame) = [i == "B" ? 1 : 0 for i in df[:race]]
 
 
 function get_different_cols(df::DataFrame=raw(), cols::Vector{Symbol}=demo_cols())
-  df2::DataFrame = copy(df[:, [:dx; cols]])
-  in(:race, names(df2)) && (df2[:race] = convert_race(df2))
+  df2::DataFrame = begin
+    ret::DataFrame = copy(df[:, [:dx; cols]])
+    in(:race, names(ret)) && (ret[:race] = convert_race(ret))
+    ret
+  end
 
-  pval(c::Symbol) = calcanova2(c, df2).resultsInfo[1, :PValue]
+  pval(c::Symbol) = calcstatdiff(c, df2)
 
   pvalsraw::Dict{Symbol, Float64} = [c => pval(c) for c in cols]
   pvalsadj::Dict{Symbol, Float64} = Dict(
@@ -412,17 +461,41 @@ end
 function get_differents_df(df::DataFrame=raw(),
                            cols::Vector{Symbol}=demo_cols();
                            normalize::Bool=false)
-  different_cols::Vector{Symbol} = begin
-    cols_ps::Dict{Symbol, Float64} = get_different_cols(df, cols)
-    [cp[1] for cp in sort(collect(cols_ps), by=cp->cp[2])]
-  end
+  different_cols::Vector{Symbol} = collect(keys(get_different_cols()))
 
   input = copy(df[[:dx; different_cols]])
   for c in different_cols
-    input[c] = permute_na(input[c], mean)
+    tmp::DataArray{Float64} = permute_na_floatsafe(input[c])
     if normalize
-      input[c] = (input[c] - mean(input[c]))/std(input[c])
+      na_ixs::Vector{Bool} = [isna(i)::Bool for i in length(input[c])]
+
+      tmp[!na_ixs] = normalize_variables(input[c])
+      tmp[na_ixs] = 0.
     end
+    input[c] = tmp
   end
+
   stack(input, different_cols)
+end
+
+
+function get_table()
+  data_cols::Vector{Symbol} = names(group_by_dx())[2:end]
+  different_cols::Vector{Bool} = begin
+    diff_cols::Set{Symbol} = Set(keys(get_different_cols()))
+    [in(d, diff_cols) for d in data_cols]
+  end
+
+  ret = DataFrame()
+  ret[:measure] = names(group_by_dx())[2:end]
+
+  for r in 1:size(group_by_dx(), 1)
+    dx::Symbol = group_by_dx()[r, :dx]
+    measures::Vector{AbstractString} = Array(group_by_dx()[r, data_cols])[:]
+    ret[dx] = measures
+  end
+
+  ret[symbol("is-significant")] = different_cols
+
+  ret
 end
