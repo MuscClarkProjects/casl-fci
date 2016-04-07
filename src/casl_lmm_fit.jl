@@ -359,7 +359,7 @@ function col_measures(df::AbstractDataFrame, col::Symbol)
   item_counts(label_fn) = begin
     cts = [label_fn(c, count(i -> i == c, df[col]))
            for c in unique(df[col])]
-    join(cts, ", ")
+    join(sort(cts), ", ")
   end
 
   fmt(r::Float64) = ( abs(r)>1e3 || abs(r)<1e-3 ) ? format("{:.3e}", r) : format("{:.3f}", r)
@@ -373,7 +373,7 @@ function col_measures(df::AbstractDataFrame, col::Symbol)
     isa(da, AbstractVector{Float64}) || (da = convert2float(da))
 
     mn, std = mean_and_std(Array(permute_na(da, mean)))
-    "$(fmt(mn)) ± $(fmt(std))"
+    "$(fmt(mn)) ($(fmt(std)))"
   end
 end
 
@@ -428,7 +428,7 @@ function calcstatdiff(col::Symbol, df::DataFrame=raw())
   dxdata(dx::Symbol) = permute_na_floatsafe(df[df[:dx] .== dx, col])
 
   @switch col begin
-    :race; chisq(df[col])[2]; #extra semi-colon for proper syntax highlighting in Juno
+    :race; chisq(df[col])[2];
     :sex; chisq(df[col])[2];
     calcanova(map(dxdata, [:nc, :mci, :ad])...).resultsInfo[1, :PValue]
   end
