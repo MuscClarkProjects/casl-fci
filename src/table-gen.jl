@@ -47,14 +47,16 @@ function col_measures(df::AbstractDataFrame, col::Symbol)
   end
 end
 
-demo_cols() = Symbol[symbol(n) for n in readcsv("$data_dir/input/demographics_cols.csv")]
 
+demo_cols() = Symbol[symbol(n) for n in readcsv("$data_dir/input/demographics_cols.csv")]
 
 
 function merge_aami_into_nc!(df::DataFrame)
   df[df[:dx] .== :aami, :dx] = :nc
   df
 end
+
+
 merge_aami_into_nc(df::DataFrame) = merge_aami_into_nc!(copy(df))
 
 
@@ -84,11 +86,14 @@ end
 true_fn(args...) = true
 
 
-function mk_contigency_tbl(df::DataFrame, index_col::Symbol, header_col::Symbol)
+function mk_contigency_tbl(df::DataFrame,
+                           index_col::Symbol,
+                           header_col::Symbol,
+                           index_filter::Function=true_fn)
   get_categories(col::Symbol) = unique(dropna(df[col]))
 
   headers::AbstractVector = get_categories(header_col)
-  indexes::AbstractVector = get_categories(index_col)
+  indexes::AbstractVector = filter(index_filter, get_categories(index_col))
 
   ret = DataFrame()
   ret[index_col] = indexes
@@ -109,10 +114,41 @@ function mk_contigency_tbl(df::DataFrame, index_col::Symbol, header_col::Symbol)
 end
 
 
-function fisher_exact(df::DataFrame, index_col::Symbol, header_col::Symbol)
+function calc_individuals_categorical(header_col::Symbol,
+                                      df::DataFrame=raw(),
+                                      index_col::Symbol=:dx,
+                                      valid_indexes::AbstractVector{Symbol}=[:nc, :mci, :ad]
+                                      )
+  lefts = Symbol[]
+  rights = Symbol[]
+  ps = Float64[]
+  num_ixs::Int64 = length(valid_indexes)
+
+  valid_indexes = unique(valid_indexes)
+
+  for left_ix = 1:num_ixs
+    for right_ix = (left_ix + 1):num_ixs
+      left::Symbol, right::Symbol = valid_indexes[[left_ix, right_ix]]
+      index_filter(icol::Symbol) = (icol == left) || (icol == right)
+      omn_res = calc_omnibus_categorical(df, index_col, header_col, index_filter)
+      p::Float64 = omn_res[symbol("p.value")][1]
+      ps = [ps; p]
+      lefts = [lefts; left]
+      rights = [rights; right]
+    end
+  end
+
+  ret = DataFrame(left=lefts, right=rights, pval=ps)
+end
+
+
+function calc_omnibus_categorical(df::DataFrame,
+                                  index_col::Symbol,
+                                  header_col::Symbol,
+                                  index_filter::Function=true_fn)
 
   con_table::Matrix{Int64} = begin
-    ret::DataFrame = mk_contigency_tbl(df, index_col, header_col)
+    ret::DataFrame = mk_contigency_tbl(df, index_col, header_col, index_filter)
     Matrix(ret[:, 2:end])
   end
 
@@ -123,31 +159,26 @@ end
 @memoize is_categorical(col::Symbol) = in(col, [:race, :sex])
 
 
-function calcanova_dx(col::Symbol, df::DataFrame=raw())
-  da::DataArray = df[col]
+function calc_omnibus_continuous(x_col::Symbol, df::DataFrame=raw();
+                      y_col::Symbol=:dx,
+                      valid_ys::Vector{Symbol}=[:nc, :mci, :ad])
+  da::DataArray = df[x_col]
 
-  dxdata(dx::Symbol) = DataGroup(
-    permute_na_floatsafe(da[df[:dx] .== dx]),
-    dx)
-  calcanova(map(dxdata, [:nc, :mci, :ad])...)
+  classdata(class::Symbol) = SimpleAnova.DataGroup(
+    permute_na_floatsafe(da[df[y_col] .== class]),
+    class)
+
+  calcanova(map(classdata, valid_ys)...)
 end
 
 
-function calc_omnibus_dx(col::Symbol, df::DataFrame=raw())
+function calc_omnibus(col::Symbol, df::DataFrame=raw())
   da::DataArray = df[col]
 
-  f_exact() = fisher_exact(df, :dx, col)[symbol("p.value")][1]
+  f_exact() = calc_omnibus_categorical(df, :dx, col)[symbol("p.value")][1]
 
   is_categorical(col) ? f_exact() :
-    calcanova_dx(col, df).resultsInfo[1, :PValue]
-end
-
-
-function calc_indi_comparisons_dx(col::Symbol, df::DataFrame=raw())
-  if is_categorical(col)
-    indis::DataFrame = tukey(calcanova_dx)
-    ix_to_dx = Dict(1 => :nc, 2 => :mci, 3 => :ad)
-  end
+    calc_omnibus_continuous(col, df).resultsInfo[1, :PValue]
 end
 
 
@@ -161,7 +192,7 @@ function get_pvalues(df::DataFrame=raw(), cols::Vector{Symbol}=demo_cols())
     ret
   end
 
-  pval(c::Symbol) = calc_omnibus_dx(c, df2)
+  pval(c::Symbol) = calc_omnibus(c, df2)
 
   pvalsraw::Dict{Symbol, Float64} = [c => pval(c) for c in cols]
   Dict(
@@ -173,27 +204,6 @@ end
 
 function get_different_cols(df::DataFrame=raw(), cols::Vector{Symbol}=demo_cols(); alpha=.05)
   filter( (c, p) -> p < alpha, get_pvalues(df, cols))
-end
-
-
-function get_differents_df(df::DataFrame=raw(),
-                           cols::Vector{Symbol}=demo_cols();
-                           normalize::Bool=false)
-  different_cols::Vector{Symbol} = collect(keys(get_different_cols()))
-
-  input = copy(df[[:dx; different_cols]])
-  for c in different_cols
-    tmp::DataArray{Float64} = permute_na_floatsafe(input[c])
-    if normalize
-      na_ixs::Vector{Bool} = [isna(i)::Bool for i in length(input[c])]
-
-      tmp[!na_ixs] = normalize_variables(input[c])
-      tmp[na_ixs] = 0.
-    end
-    input[c] = tmp
-  end
-
-  stack(input, different_cols)
 end
 
 
@@ -224,16 +234,21 @@ end
 rank(df::DataFrame, alpha=.05) = rank(df[:left], df[:right], df[:pval] .< alpha)
 
 
-function rank_msg(items::AbstractVector{SimpleAnova.Label}, ranks::AbstractVector{Int64})
+function rank_msg{T <: Union{Symbol, ASCIIString}}(
+    items::AbstractVector{T},
+    ranks::AbstractVector{Int64},
+    diff_join::AbstractString,
+    equal_join::AbstractString=", ")
+
   sorted_ranks::Vector{Int64} = sort(unique(ranks), rev=true)
   comma_join(rank::Int64) = join(
     items[ranks .== rank],
-    ", ")
-  join(map(comma_join, sorted_ranks), " > ")
+    equal_join)
+  join(map(comma_join, sorted_ranks), diff_join)
 end
 
 
-rank_msg(df::DataFrame) = rank_msg(df[:item], df[:rank])
+rank_msg(df::DataFrame, diff_join::AbstractString) = rank_msg(df[:item], df[:rank], diff_join)
 
 
 function get_table()
@@ -256,14 +271,12 @@ function get_table()
     gen_msg(col::Symbol) = begin
       isSig = in(col, different_cols)
       if isSig
-        pvalue::AbstractString = fmt_float(different_cols_and_pvalues[col])
-        if is_categorical(col)
-          "$pvalue, Fisher-Exact"
-        else
-          tukey_res::DataFrame = tukey(calcanova_dx(col))
-          tukey_rank::DataFrame = rank(tukey_res)
-          rank_msg(tukey_rank)
-        end
+        indis::DataFrame, diff_join::AbstractString = is_categorical(col) ?
+          (calc_individuals_categorical(col), " not eq. ") :
+          (tukey(calc_omnibus_continuous(col)), " > ")
+
+        ranks::DataFrame = rank(indis)
+        rank_msg(ranks, diff_join)
       else
         "ns"
       end
