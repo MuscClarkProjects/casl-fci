@@ -63,9 +63,9 @@ merge_aami_into_nc(df::DataFrame) = merge_aami_into_nc!(copy(df))
 function group_by_dx(df::DataFrame=raw();
                      cols::AbstractVector{Symbol}=demo_cols())
 
-  set_col_measures(grouped_df::AbstractDataFrame) = begin
+  set_col_measures(sub_df::SubDataFrame) = begin
     reduce(DataFrame(), cols) do acc, c
-      acc[c] = col_measures(grouped_df, c)
+      acc[c] = col_measures(sub_df, c)
       acc
     end
   end
@@ -116,7 +116,7 @@ end
 
 function calc_individuals_categorical(header_col::Symbol,
                                       df::DataFrame=raw(),
-                                      index_col::Symbol=:dx,
+                                      index_col::Symbol=:dx;
                                       valid_indexes::AbstractVector{Symbol}=[:nc, :mci, :ad]
                                       )
   lefts = Symbol[]
@@ -161,14 +161,14 @@ end
 
 function calc_omnibus_continuous(x_col::Symbol, df::DataFrame=raw();
                       y_col::Symbol=:dx,
-                      valid_ys::Vector{Symbol}=[:nc, :mci, :ad])
+                      valid_indexes::Vector{Symbol}=[:nc, :mci, :ad])
   da::DataArray = df[x_col]
 
   classdata(class::Symbol) = SimpleAnova.DataGroup(
     permute_na_floatsafe(da[df[y_col] .== class]),
     class)
 
-  calcanova(map(classdata, valid_ys)...)
+  calcanova(map(classdata, valid_indexes)...)
 end
 
 
@@ -251,29 +251,46 @@ end
 rank_msg(df::DataFrame, diff_join::AbstractString) = rank_msg(df[:item], df[:rank], diff_join)
 
 
+function add_controls_gt_60(df::DataFrame = raw())
+  orig::DataFrame = df
+  nc_gt_60::Vector{Bool} = (orig[:age] .>= 60) & (orig[:dx] .== :nc)
+  gt_60::DataFrame = orig[nc_gt_60, :]
+  gt_60[:dx] = :nc_gt_60
+  vcat(orig, gt_60)
+end
+
+
 function get_table()
-  data_cols::Vector{Symbol} = names(group_by_dx())[2:end]
+  df::DataFrame = add_controls_gt_60()
+  grouped_df::DataFrame = group_by_dx(df)
+
+  data_cols::Vector{Symbol} = names(grouped_df)[2:end]
 
   ret = DataFrame()
   ret[:measure] = data_cols
 
-  for r in 1:size(group_by_dx(), 1)
-    dx::Symbol = group_by_dx()[r, :dx]
-    measures::Vector{AbstractString} = Array(group_by_dx()[r, data_cols])[:]
+  dxs::AbstractVector{Symbol} = collect(unique(df[:dx]))
+
+  for r in 1:size(grouped_df, 1)
+    dx::Symbol = grouped_df[r, :dx]
+    measures::Vector{AbstractString} = Array(grouped_df[r, data_cols])[:]
     ret[dx] = measures
   end
 
-
   different_cols_msg::Vector{AbstractString} = begin
-    different_cols_and_pvalues::Dict{Symbol, Float64} = get_different_cols()
+    different_cols_and_pvalues::Dict{Symbol, Float64} = get_different_cols(df)
     different_cols::Set{Symbol} = Set(keys(different_cols_and_pvalues))
 
     gen_msg(col::Symbol) = begin
       isSig = in(col, different_cols)
       if isSig
         indis::DataFrame, diff_join::AbstractString = is_categorical(col) ?
-          (calc_individuals_categorical(col), " not eq. ") :
-          (tukey(calc_omnibus_continuous(col)), " > ")
+          (
+            calc_individuals_categorical(col, df, valid_indexes=dxs),
+            " not eq. ") :
+          (
+            tukey(calc_omnibus_continuous(col, df, valid_indexes=dxs)),
+            " > ")
 
         ranks::DataFrame = rank(indis)
         rank_msg(ranks, diff_join)
@@ -288,16 +305,18 @@ function get_table()
 
   header_maps::Dict{Symbol, Symbol} = begin
     count_msg::Dict{Symbol, AbstractString} = [
-      dx => "(n=$(sum(raw()[:dx] .== dx)))" for dx in [:nc, :mci, :ad]]
-    Dict(:nc => symbol("NC $(count_msg[:nc])"),
-         :mci => symbol("MCI $(count_msg[:mci])"),
-         :ad => symbol("AD $(count_msg[:ad])"),
+      dx => "(n=$(sum(df[:dx] .== dx)))" for dx in dxs]
+    count_kv(c::Symbol, msg::AbstractString) = c => symbol("$msg $(count_msg[c])")
+    Dict(count_kv(:nc, "NC"),
+         count_kv(:mci, "MCI"),
+         count_kv(:ad, "AD"),
+         count_kv(:nc_gt_60, "NC 60+")
          )
   end
 
   rename!(ret, header_maps)
 
-  ret[symbol("Significance")] = different_cols_msg
+  ret[:Significance] = different_cols_msg
 
   ret
 end
